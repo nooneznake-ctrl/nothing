@@ -4,8 +4,8 @@ import re
 import time
 from getpass import getpass
 import requests
-from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 TARGET_TXT_PATH = r"yours path file for json export"
@@ -14,7 +14,7 @@ DEBUG_PORT = 9222
 LOGIN_URL = "https://pawchive.st/account/login"
 BASE_URL = "https://pawchive.st"
 
-# Set to False so it skips already-processed items instead of re-toggling them -- doesnt matter for you
+# Set to False so it skips already-processed items instead of re-toggling them
 RECHECK_FIRST_80 = False
 
 # Set to True if you want to inspect the raw HTML of the first post in console
@@ -164,64 +164,76 @@ class HybridPawchiveAutomationApp:
         self.log("⚡ Session hijacked successfully!")
 
     def process_favorite_hybrid(self, url, post_id, service, user_id):
-    try:
-        # 1. Fetch raw HTML of the post page
-        resp = self.http_session.get(url, timeout=8)
-        if resp.status_code != 200:
-            return "error", f"HTTP {resp.status_code}"
+        """
+        Uses raw HTTP requests, detects favorited status precisely via BeautifulSoup,
+        extracts the favorite endpoint, and triggers favoriting safely.
+        """
+        try:
+            # 1. Fetch raw HTML of the post page
+            resp = self.http_session.get(url, timeout=8)
+            if resp.status_code != 200:
+                return "error", f"HTTP {resp.status_code}"
 
-        html_text = resp.text
-        soup = BeautifulSoup(html_text, "html.parser")
+            html_text = resp.text
 
-        # 2. Precise Button Target (Avoid false positives from post descriptions)
-        fav_btn = soup.select_one(".post__favorite-button, button[class*='favorite'], a[class*='favorite']")
+            if DEBUG_HTML_OUTPUT and self.done == 0:
+                print("\n================ DEBUG HTML OUTPUT ================")
+                print(html_text[:3000])
+                print("===================================================\n")
 
-        if fav_btn:
-            btn_str = str(fav_btn).lower()
-            # Precise check on the actual button element only
-            if "active" in btn_str or "favorited" in btn_str or "aria-pressed=\"true\"" in btn_str:
+            soup = BeautifulSoup(html_text, "html.parser")
+
+            # 2. Precise Button State Detection (Prevents False Positives)
+            fav_btn = soup.select_one(".post__favorite-button, button[class*='favorite'], a[class*='favorite'], button[title*='favorite']")
+
+            if fav_btn:
+                btn_str = str(fav_btn).lower()
+                # Check properties strictly on the button itself
+                if "active" in btn_str or "favorited" in btn_str or 'aria-pressed="true"' in btn_str or 'unfavorite' in btn_str:
+                    return "already_favorited", None
+
+            # 3. Target Endpoint Extraction
+            target_path = None
+            if fav_btn:
+                target_path = fav_btn.get("href") or fav_btn.get("data-url") or fav_btn.get("action")
+
+            if not target_path:
+                # Fallback Regex restricted to forms/buttons
+                fav_match = re.search(r'(?:action|href)=["\']([^"\']*(?:favorite|favourite|fav)[^"\']*)["\']', html_text, re.IGNORECASE)
+                if fav_match:
+                    target_path = fav_match.group(1)
+
+            if target_path:
+                if not target_path.startswith("http"):
+                    api_fav_url = f"{BASE_URL}{target_path}" if target_path.startswith("/") else f"{BASE_URL}/{target_path}"
+                else:
+                    api_fav_url = target_path
+            else:
+                # Fallback standard endpoint structure
+                api_fav_url = f"{BASE_URL}/api/v1/favorites/post/{service}/{user_id}/{post_id}"
+
+            # 4. Fire Favorite Request
+            headers = {
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": url,
+                "Accept": "application/json, text/plain, */*"
+            }
+
+            post_resp = self.http_session.post(api_fav_url, headers=headers, timeout=8)
+
+            # Fallback to GET if endpoint expects link navigation
+            if post_resp.status_code in (404, 405):
+                post_resp = self.http_session.get(api_fav_url, headers=headers, timeout=8)
+
+            if post_resp.status_code in (200, 201, 204):
+                return "favorited", None
+            elif post_resp.status_code == 400 or "already" in post_resp.text.lower():
                 return "already_favorited", None
+            else:
+                return "error", f"Fav Request Status {post_resp.status_code} ({api_fav_url})"
 
-        # 3. Dynamic Form/Action Extraction
-        # Look specifically for form actions or API links attached to the favorite element
-        target_path = None
-        if fav_btn:
-            target_path = fav_btn.get("href") or fav_btn.get("data-url")
-
-        if not target_path:
-            # Fallback regex search restricted to form action tags
-            fav_match = re.search(r'action=["\']([^"\']*(?:favorite|fav)[^"\']*)["\']', html_text, re.IGNORECASE)
-            if fav_match:
-                target_path = fav_match.group(1)
-
-        # 4. Construct API URL
-        if target_path:
-            api_fav_url = f"{BASE_URL}{target_path}" if target_path.startswith("/") else target_path
-        else:
-            # Default Pawchive endpoint format
-            api_fav_url = f"{BASE_URL}/api/v1/favorites/post/{service}/{user_id}/{post_id}"
-
-        # 5. Fire Request
-        headers = {
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": url,
-            "Accept": "application/json, text/plain, */*"
-        }
-        
-        post_resp = self.http_session.post(api_fav_url, headers=headers, timeout=8)
-
-        if post_resp.status_code in (404, 405):
-            post_resp = self.http_session.get(api_fav_url, headers=headers, timeout=8)
-
-        if post_resp.status_code in (200, 201, 204):
-            return "favorited", None
-        elif post_resp.status_code == 400 or "already" in post_resp.text.lower():
-            return "already_favorited", None
-        else:
-            return "error", f"Status {post_resp.status_code} on {api_fav_url}"
-
-    except Exception as e:
-        return "error", str(e)
+        except Exception as e:
+            return "error", str(e)
 
     def run_automation(self, urls, username, password):
         processed_set = load_processed_urls()
@@ -303,9 +315,9 @@ if __name__ == "__main__":
     username = HARDCODED_USERNAME
     password = HARDCODED_PASSWORD
 
-    if not username:
+    if not username or username == "yours":
         username = input("Enter Pawchive Username: ").strip()
-    if not password:
+    if not password or password == "yours":
         password = getpass("Enter Pawchive Password: ")
 
     urls_to_process = load_urls_from_file(TARGET_TXT_PATH)
